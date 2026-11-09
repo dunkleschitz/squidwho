@@ -1,0 +1,1857 @@
+#!/usr/bin/env python3
+"""squidwho - which `http_access` line allows or denies a request, and
+which `acl` lines decided it.
+
+A static model of Squid's documented access rules
+(DESIGN-squidwho.md, BUILD APPROVED 2026-11-09). Semantics pinned to
+the Squid configuration manual (5.10 / 6.9 / 7.0), the Squid wiki
+SquidFaq/SquidAcl, *Squid: The Definitive Guide* SS6.2, and the
+squid-users 2012-06-20 note on http_access evaluation. Claims are
+tagged [documented], [docs-inferred], or [hypothesized]; no Squid
+binary exists on this box, so no claim here is [observed] and there
+is no live-agreement test to skip-guard against: `squid -k parse`
+validates syntax but dumps no access decisions, so hermetic fixture
+trees are the only oracle.
+
+Pinned semantics (SQ01-SQ24 in the design doc):
+- SQ01 first match wins; AND within a rule, OR across rules; `!`
+  negates one ACL element; a rule with no ACL elements matches
+  unconditionally. Each directive type has its own rule list.
+- SQ02 ACLs must be defined before use (single pass); same name +
+  same type merges (values OR); same name + different type is fatal
+  for rules using it; `all` is pre-defined as `src all` iff the
+  file never defines it.
+- SQ03 evaluable ACL types: src, dst, dstdomain, dstdom_regex,
+  url_regex, urlpath_regex, port, myport/localport, localip/myip,
+  method, proto, time. Everything else is SQ12.
+- SQ04 value OR-logic inside one ACL (inline, merged, file-expanded).
+- SQ05 http_access is request-only; no reply-side poisoning.
+- SQ06 no-match default reverses the last rule; no rules at all
+  means deny. A config ending in `http_access deny ...` with no
+  trailing `deny all` silently allows everything unmatched.
+- SQ07 URL composition incl. CONNECT authority-form (host:port,
+  no path, no scheme); urlpath_regex tests the empty string for
+  CONNECT. The composed URL is shown in the output.
+- SQ08 dstdomain: exact host vs `.domain` (whole domain, incl. the
+  bare domain), case-insensitive, one trailing dot stripped; the
+  splay-tree overlap quirk is flagged and the union is evaluated;
+  IP URLs need a reverse lookup (UNKNOWN) unless `-n` (FALSE), and
+  a `none` pattern against an IP URL is UNKNOWN.
+- SQ10 three-valued (Kleene) rules: FALSE dominates, then UNKNOWN,
+  then TRUE; `!` keeps UNKNOWN unknown. A rule matches iff its AND
+  is TRUE; an UNKNOWN rule before any TRUE rule is a blocker.
+- SQ11 time ACLs: day abbreviations S M T W H F A, h1:m1 < h2:m2
+  (reversed is a parse error), specs OR; `--at` is the reproducible
+  form, otherwise local now with the [time-is-now-local] banner.
+- SQ12 unmodeled dynamism is bannered and UNKNOWN-poisoning, never
+  approximated.
+- SQ13 the walk: first TRUE rule wins, else the SQ06 default.
+- SQ15 regex is an approximation: POSIX classes translated to
+  Python `re` where they coincide; untranslatable patterns are
+  UNKNOWN; regex-decided verdicts carry [regex-approx]. `-i`/`+i`
+  flags are per-pattern, tracked in order.
+- SQ16-SQ24 structural findings, coverage on every run, inventory
+  modes, the http_access-only banner, and the exact verdict
+  vocabulary ALLOW / DENY / UNKNOWN.
+
+The tool never runs squid, never opens a socket, never performs DNS,
+never writes, and never reads the process environment, and opens
+config, include, and ACL value files read-only.
+
+Exit codes: 0 verdict ALLOW rendered (by rule or by SQ06 reversal,
+labeled), or an inventory mode with >=1 item; 1 verdict DENY or
+UNKNOWN, or an inventory mode with nothing listed; 2 usage error,
+missing config, include depth exceeded / missing include file (SQ19),
+or a --url without a scheme.
+"""
+
+import argparse
+import datetime
+import glob
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+DEFAULT_CONF = "/etc/squid/squid.conf"
+MAX_INCLUDE_DEPTH = 16
+
+# ---------------------------------------------------------------- findings
+
+class Finding:
+    """One structural finding. `fid` is a design-doc id (SQ01..SQ24)
+    or "GEN" for a generic loader problem; `severity` is one of
+    "finding", "warning", "info". `where` is "path:line" or None."""
+    def __init__(self, fid, severity, message, where=None):
+        self.fid = fid
+        self.severity = severity
+        self.message = message
+        self.where = where
+
+    def text(self):
+        loc = " (%s)" % self.where if self.where else ""
+        return "[%s] %s: %s%s" % (self.fid, self.severity, self.message, loc)
+
+    def as_json(self):
+        return {"id": self.fid, "severity": self.severity,
+                "message": self.message, "where": self.where}
+
+
+class FatalConfig(Exception):
+    """A loader defect that ends the run (exit 2): unreadable or
+    missing config, missing include, include depth exceeded."""
+    def __init__(self, message, where=None):
+        super().__init__(message)
+        self.message = message
+        self.where = where
+
+
+class UsageError(Exception):
+    """A CLI usage defect (exit 2)."""
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+# ------------------------------------------------------------- three-valued
+
+# Kleene three-valued logic values.
+TRUE = "TRUE"
+FALSE = "FALSE"
+UNKNOWN = "UNKNOWN"
+
+
+def tri_and(vals):
+    if FALSE in vals:
+        return FALSE
+    if UNKNOWN in vals:
+        return UNKNOWN
+    return TRUE
+
+
+def tri_or(vals):
+    if TRUE in vals:
+        return TRUE
+    if UNKNOWN in vals:
+        return UNKNOWN
+    return FALSE
+
+
+def tri_not(val):
+    if val == TRUE:
+        return FALSE
+    if val == FALSE:
+        return TRUE
+    return UNKNOWN
+
+
+# --------------------------------------------------------------- tokenizing
+
+class Token:
+    """One config token. `quoted` records whether the token was
+    written in double quotes -- a quoted ACL value names an
+    external value file (SQ20), an unquoted one is a literal."""
+    __slots__ = ("text", "quoted")
+
+    def __init__(self, text, quoted=False):
+        self.text = text
+        self.quoted = quoted
+
+    def __repr__(self):
+        return "Token(%r, quoted=%r)" % (self.text, self.quoted)
+
+
+def tokenize(line):
+    """Split a config line into tokens. `#` starts a comment outside
+    quotes; double (or single) quotes group one token; a `#` inside
+    quotes is literal. Backslash escapes the next char inside
+    quotes. [documented -- cfgman quoting + comment rules]"""
+    tokens = []
+    cur = []
+    quoted = False
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            if ch == "\\" and i + 1 < len(line):
+                cur.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "#":
+            break
+        if ch in ("'", '"'):
+            quote = ch
+            quoted = True
+            i += 1
+            continue
+        if ch.isspace():
+            if cur or quoted:
+                tokens.append(Token("".join(cur), quoted))
+                cur = []
+                quoted = False
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if cur or quoted:
+        tokens.append(Token("".join(cur), quoted))
+    return tokens
+
+
+def logical_lines(path):
+    """Yield (lineno, text) logical lines of a config file: physical
+    lines joined on backslash-newline continuation. The line number
+    reported is the first physical line of the logical line."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    phys = raw.split("\n")
+    if phys and phys[-1] == "":
+        phys.pop()
+    out = []
+    i = 0
+    while i < len(phys):
+        lineno = i + 1
+        text = phys[i]
+        while text.endswith("\\") and i + 1 < len(phys):
+            text = text[:-1] + phys[i + 1]
+            i += 1
+        out.append((lineno, text))
+        i += 1
+    return out, len(raw.encode("utf-8", errors="replace"))
+
+
+# ------------------------------------------------------------------ loader
+
+class Item:
+    """One parsed directive occurrence in load order."""
+    __slots__ = ("directive", "tokens", "where", "seq", "file")
+
+    def __init__(self, directive, tokens, where, seq, file):
+        self.directive = directive
+        self.tokens = tokens
+        self.where = where
+        self.seq = seq
+        self.file = file
+
+
+# Directive names in the cfgman index (Squid 5.10 / 6.9 / 7.0). The
+# recognizer is generous: any name here is a known directive and its
+# line is skipped cleanly, never poison (SQ21). Anything else is an
+# unparseable line.
+KNOWN_DIRECTIVES = set("""
+acl access_log acl_uses_indirect_client adapted_http_access
+always_direct announce_host announce_period announce_port announce_to
+as_whois_server authenticate_cache_garbage_interval
+authenticate_ip_shortcircuit_ttl authenticate_ttl
+auth_param balance_on_multiple_ip broken_vary_encoding buffered_logs
+cache cache_access_log cache_allow cache_dir cache_dns_program
+cache_effective_group cache_effective_user cache_host cache_host_acl
+cache_host_domain cache_log cache_mem cache_mgr cache_peer
+cache_peer_access cache_peer_domain cache_replacement_policy
+cache_snapshot cache_store_log cache_swap_high cache_swap_log
+cache_swap_low cachemgr_passwd client_db client_lifetime
+client_persistent_connections clock collapsed_forwarding connect_timeout
+coredump_dir dead_peer_timeout debug_options delay_access delay_body
+delay_class delay_initial_bucket_level delay_parameters delay_pools
+deny_info digest_bits_per_entry digest_generation digest_rebuild_count
+digest_rebuild_period digest_swapout_chunk_size dns_defnames
+dns_nameservers dns_testnames eui_lookup external_acl_type
+external_refresh_check fqdncache forwarded_for forward_max_tries
+forward_timeout ftp_passive half_closed_clients header_access
+header_replace hierarchy_stoplist hosts_file http_access http_access2
+http_port http_reply_access https_port icp_access icp_hit_stale icp_port
+icp_query_timeout ident_lookup ident_lookup_access include
+incoming_dns_average incoming_http_average incoming_icp_average
+ipcache ipcache_high ipcache_low ipcache_size log_icp_queries
+log_mime_hdrs logformat logfile_daemon logfile_rotate
+maximum_object_size maximum_object_size_in_memory
+maximum_single_addr_tries memory_cache_mode memory_replacement_policy
+message mime_table minimum_expiry_time minimum_object_size miss_access
+negative_dns_ttl negative_ttl netdb netdb_high netdb_low never_direct
+no_cache offline_mode pconn_timeout peer_connect_timeout peer_select
+pid_filename prefer_direct query_icmp quick_abort_max quick_abort_min
+read_timeout redirector redirector_access refresh_pattern
+reload_into_ims request_body_max_size request_header_max_size
+request_timeout retry_on_error send_hit server_persistent_connections
+shutdown_lifetime single_parent_bypass sleep_after_fork snmp_access
+snmp_incoming_address snmp_outgoing_address snmp_port ssl_bump
+ssl_engine ssl_flags sslpassword_program strip_query_terms
+tcp_outgoing_address tcp_outgoing_tos tcp_recv_bufsize
+test_reachability tls_outgoing_options udp_incoming_address
+udp_outgoing_address umask unlinkd_program uri_whitespace
+url_rewrite_access url_rewrite_host_header url_rewrite_program
+useragent_log vary via visible_hostname wais_relay wccp wccp2
+zero_sizes cache_effective_user forwarded_for
+""".split())
+
+# Directives that take access-rule lists of their own, present but
+# never verdicted (SQ23). Inventoried in coverage with counts.
+OTHER_ACCESS_DIRECTIVES = {
+    "cache_peer_access", "always_direct", "never_direct", "miss_access",
+    "http_reply_access", "adapted_http_access", "delay_access",
+    "cache", "no_cache", "ssl_bump", "icp_access",
+    "ident_lookup_access", "url_rewrite_access", "redirector_access",
+    "snmp_access", "http_access2",
+}
+
+
+class Loader:
+    """Loads config files into ordered Items, expanding `include`
+    in place (SQ19)."""
+
+    def __init__(self):
+        self.items = []
+        self.files = []          # {"path", "bytes", "lines", "included_from"}
+        self.findings = []
+        self.seq = 0
+
+    def load(self, paths):
+        for path in paths:
+            self._load_one(path, 0, None)
+        return self.items
+
+    def _load_one(self, path, depth, included_from):
+        if depth > MAX_INCLUDE_DEPTH:
+            raise FatalConfig(
+                "include depth exceeded (cap is %d levels, SQ19)"
+                % MAX_INCLUDE_DEPTH, where=path)
+        try:
+            lines, nbytes = logical_lines(path)
+        except (OSError, IOError) as exc:
+            raise FatalConfig("cannot read config file %s: %s"
+                              % (path, exc), where=path)
+        self.files.append({"path": path, "bytes": nbytes,
+                           "lines": len(lines),
+                           "included_from": included_from})
+        base_dir = os.path.dirname(os.path.abspath(path))
+        for lineno, text in lines:
+            tokens = tokenize(text)
+            if not tokens:
+                continue
+            where = "%s:%d" % (path, lineno)
+            directive = tokens[0].text
+            if directive == "include":
+                self._do_include(tokens[1:], base_dir, depth, where)
+                continue
+            self.items.append(Item(directive, tokens, where,
+                                   self.seq, path))
+            self.seq += 1
+
+    def _do_include(self, tokens, base_dir, depth, where):
+        if not tokens:
+            self.findings.append(Finding(
+                "SQ21", "warning",
+                "include directive with no file argument", where))
+            return
+        for tok in tokens:
+            pattern = tok.text
+            if not os.path.isabs(pattern):
+                self.findings.append(Finding(
+                    "SQ19", "info",
+                    "relative include %r resolved against the "
+                    "including file's directory %s (config-directory "
+                    "reading, [docs-inferred])" % (pattern, base_dir),
+                    where))
+                pattern = os.path.join(base_dir, pattern)
+            if glob.has_magic(pattern):
+                matches = sorted(glob.glob(pattern))
+                if not matches:
+                    raise FatalConfig(
+                        "include wildcard %r matched no files (SQ19)"
+                        % tok.text, where=where)
+                for match in matches:
+                    self._load_one(match, depth + 1, where)
+            else:
+                if not os.path.isfile(pattern):
+                    raise FatalConfig(
+                        "include file %r does not exist (SQ19)"
+                        % tok.text, where=where)
+                self._load_one(pattern, depth + 1, where)
+
+# ------------------------------------------------------------ ACL model
+
+EVALUABLE_TYPES = {
+    "src", "dst", "dstdomain", "dstdom_regex", "url_regex",
+    "urlpath_regex", "port", "myport", "localport", "localip",
+    "myip", "method", "proto", "time",
+}
+
+# cfgman ACL types that are recognized but unmodeled in v1 (SQ12):
+# identity, network, or runtime state, or inputs the CLI does not
+# take. Any of these is a clean SQ12 term, never a guess.
+UNMODELED_TYPES = {
+    "proxy_auth", "external", "ident", "arp", "src_as", "dst_as",
+    "maxconn", "peername", "snmp_community", "referer_regex",
+    "browser", "req_header", "rep_header", "req_mime_type",
+    "rep_mime_type", "note", "tag", "random", "eui64", "connmark",
+    "urllogin", "srcdomain", "srcdom_regex",
+}
+
+# POSIX character classes and their Python `re` equivalents (SQ15).
+POSIX_CLASSES = {
+    "alpha": "a-zA-Z", "digit": "0-9", "alnum": "a-zA-Z0-9",
+    "upper": "A-Z", "lower": "a-z", "xdigit": "0-9A-Fa-f",
+    "space": r"\s", "blank": r" \t", "cntrl": r"\x00-\x1f\x7f",
+    "print": r"\x20-\x7e", "graph": r"\x21-\x7e",
+    "punct": r"""!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~""",
+}
+
+
+def translate_regex(pattern):
+    """Translate a POSIX-ERE pattern to Python `re`. Returns a
+    compiled pattern, or None when the pattern cannot be expressed
+    (SQ15: the term is then UNKNOWN, never a guess). Lookarounds
+    are not POSIX and are rejected; POSIX classes are spliced into
+    their enclosing bracket expression (`[[:digit:]]` -> `[0-9]`,
+    `[[:alpha:]x]` -> `[a-zA-Zx]`); an unknown class name or
+    anything Python cannot compile is rejected."""
+    if "(?=" in pattern or "(?!" in pattern or \
+            "(?<=" in pattern or "(?<!" in pattern:
+        return None
+
+    def _class_sub(match):
+        name = match.group(1)
+        neg = name.startswith("^")
+        if neg:
+            name = name[1:]
+        if name not in POSIX_CLASSES:
+            raise ValueError("unknown POSIX class %r" % name)
+        return ("^" if neg else "") + POSIX_CLASSES[name]
+
+    try:
+        translated = re.sub(r"\[:(\^?[A-Za-z]+):\]", _class_sub,
+                            pattern)
+    except ValueError:
+        return None
+    # A leftover [:...:] that was not a known class (e.g. a
+    # misspelled class name) is untranslatable, never a guess.
+    if re.search(r"\[:\^?[A-Za-z]+:\]", translated):
+        return None
+    try:
+        return re.compile(translated)
+    except re.error:
+        return None
+
+
+DAY_LETTERS = {"S": 6, "M": 0, "T": 1, "W": 2, "H": 3, "F": 4, "A": 5}
+TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$")
+
+
+def parse_time_specs(tokens, where, findings):
+    """Parse the value tokens of a `time` ACL into a list of specs:
+    (frozenset(weekdays) or None, (start_min, end_min) or None).
+    Returns None on a parse defect (reversed range, unknown day
+    token -- SQ21 finding raised, ACL unmodeled)."""
+    specs = []
+    days = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].text
+        m = TIME_RE.match(tok)
+        if m:
+            h1, m1, h2, m2 = (int(x) for x in m.groups())
+            if not (0 <= h1 <= 23 and 0 <= m1 <= 59):
+                findings.append(Finding(
+                    "SQ21", "finding",
+                    "time spec %r has an out-of-range start time"
+                    % tok, where))
+                return None
+            if not (0 <= h2 <= 24 and 0 <= m2 <= 59) or \
+                    (h2 == 24 and m2 != 0):
+                findings.append(Finding(
+                    "SQ21", "finding",
+                    "time spec %r has an out-of-range end time"
+                    % tok, where))
+                return None
+            start = h1 * 60 + m1
+            end = h2 * 60 + m2
+            if start >= end:
+                findings.append(Finding(
+                    "SQ21", "finding",
+                    "time spec %r is a reversed range (h1:m1 must be "
+                    "less than h2:m2, SQ11)" % tok, where))
+                return None
+            specs.append((days, (start, end)))
+            days = None
+            i += 1
+            continue
+        if tok and all(c in DAY_LETTERS for c in tok):
+            new_days = frozenset(DAY_LETTERS[c] for c in tok)
+            days = new_days if days is None else days | new_days
+            i += 1
+            continue
+        findings.append(Finding(
+            "SQ21", "finding",
+            "unknown day token %r in time ACL (weekdays/weekends "
+            "are not confirmed to parse, SQ11 -- never a guess)"
+            % tok, where))
+        return None
+    if days is not None:
+        specs.append((days, None))
+    if not specs:
+        findings.append(Finding(
+            "SQ21", "finding",
+            "time ACL with no day/time spec after the type (SQ10)",
+            where))
+        return None
+    return specs
+
+
+class AclValue:
+    """One value of one ACL, with provenance and (for regex types)
+    its compiled form and case flag."""
+    __slots__ = ("text", "provenance", "case_insensitive",
+                 "compiled", "untranslatable")
+
+    def __init__(self, text, provenance, case_insensitive=False,
+                 compiled=None, untranslatable=False):
+        self.text = text
+        self.provenance = provenance
+        self.case_insensitive = case_insensitive
+        self.compiled = compiled
+        self.untranslatable = untranslatable
+
+
+class AclDef:
+    """One named ACL: type, accumulated values, provenance."""
+    __slots__ = ("name", "type", "values", "where", "seq",
+                 "conflict", "unmodeled_reason", "no_lookup",
+                 "has_hostname", "time_specs", "builtin")
+
+    def __init__(self, name, type_, where, seq):
+        self.name = name
+        self.type = type_
+        self.values = []
+        self.where = where
+        self.seq = seq
+        self.conflict = False
+        self.unmodeled_reason = None
+        self.no_lookup = False
+        self.has_hostname = False
+        self.time_specs = None
+        self.builtin = False
+
+    def evaluable(self):
+        return self.type in EVALUABLE_TYPES and \
+            not self.conflict and self.unmodeled_reason is None
+
+
+class Rule:
+    """One http_access rule."""
+    __slots__ = ("action", "terms", "where", "seq")
+
+    def __init__(self, action, terms, where, seq):
+        self.action = action
+        self.terms = terms      # list of (negated, acl_name)
+        self.where = where
+        self.seq = seq
+
+
+def is_ssl_type(type_):
+    return type_.startswith("ssl::") or type_.startswith("tls::")
+
+
+def expand_value_file(path, config_dir, where, findings):
+    """Expand a quoted ACL value file (SQ20) into (value, provenance)
+    pairs. Relative paths resolve against the config file's
+    directory, with a finding. Returns None when the file is
+    missing/unreadable (the ACL is then unmodeled, never empty)."""
+    if not os.path.isabs(path):
+        findings.append(Finding(
+            "SQ20", "info",
+            "relative ACL value file %r resolved against the config "
+            "file's directory %s (SQ19's rule, same reason)"
+            % (path, config_dir), where))
+        path = os.path.join(config_dir, path)
+    try:
+        with open(path, "r", encoding="utf-8",
+                  errors="replace") as fh:
+            lines = fh.read().split("\n")
+    except (OSError, IOError):
+        return None
+    out = []
+    for n, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        out.append((text, "acl-file:%s:%d" % (path, n)))
+    return out
+
+
+class Config:
+    """The loaded, parsed config: ACL table, http_access rules,
+    findings, coverage data, and poisonable unparseable lines."""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self.findings = list(loader.findings)
+        self.acls = {}
+        self.rules = []
+        self.poison = []        # unparseable lines (SQ21), in order
+        self.unparseable = []   # {"where", "text"} for coverage
+        self.other_counts = {}
+        self._parse()
+
+    def _parse(self):
+        for item in self.loader.items:
+            if item.directive == "acl":
+                self._parse_acl(item)
+            elif item.directive == "http_access":
+                self._parse_rule(item)
+            elif item.directive in OTHER_ACCESS_DIRECTIVES:
+                self.other_counts[item.directive] = \
+                    self.other_counts.get(item.directive, 0) + 1
+            elif item.directive in KNOWN_DIRECTIVES:
+                pass            # recognized, unevaluated, never poisons
+            else:
+                self._unparseable(
+                    item, "unknown directive %r (not in the cfgman "
+                    "index, SQ21)" % item.directive)
+        if "all" not in self.acls:
+            builtin = AclDef("all", "src", None, -1)
+            builtin.values.append(AclValue("all", "builtin-default"))
+            builtin.builtin = True
+            self.acls["all"] = builtin
+        self._catch_all_finding()
+
+    def _unparseable(self, item, message):
+        self.findings.append(Finding("SQ21", "finding", message,
+                                     item.where))
+        text = " ".join(t.text for t in item.tokens)
+        self.poison.append(item)
+        self.unparseable.append({"where": item.where, "text": text})
+
+    def _catch_all_finding(self):
+        if not self.rules:
+            self.findings.append(Finding(
+                "SQ06", "finding",
+                "no http_access rules at all: every request is "
+                "denied by the SQ06 no-rules default"))
+            return
+        last = self.rules[-1]
+        if not self._is_catch_all(last):
+            self.findings.append(Finding(
+                "SQ06", "finding",
+                "no explicit catch-all rule: the last rule is "
+                "%s at %s, so the SQ06 default (reverse of the last "
+                "rule) decides every unmatched request -- add a "
+                "trailing `http_access deny all`" % (
+                    last.action, last.where)))
+
+    @staticmethod
+    def _is_catch_all(rule):
+        if not rule.terms:
+            return True
+        if len(rule.terms) == 1 and not rule.terms[0][0] and \
+                rule.terms[0][1] == "all":
+            return True
+        return False
+
+    def _parse_acl(self, item):
+        toks = item.tokens
+        if len(toks) < 3:
+            self.findings.append(Finding(
+                "SQ21", "finding",
+                "acl line with no name/type", item.where))
+            self.poison.append(item)
+            self.unparseable.append({
+                "where": item.where,
+                "text": " ".join(t.text for t in toks)})
+            return
+        name = toks[1].text
+        type_ = toks[2].text
+        value_toks = [t for t in toks[3:]
+                      if t.text not in ("[fast]", "[slow]")]
+        existing = self.acls.get(name)
+        if existing is not None and existing.type != type_:
+            self.findings.append(Finding(
+                "SQ16", "finding",
+                "ACL %r redefined with a different type (%s at %s, "
+                "now %s) -- the real daemon refuses the config; "
+                "rules using it are UNKNOWN (SQ02/SQ16)"
+                % (name, existing.type, existing.where, type_),
+                item.where))
+            existing.conflict = True
+            existing.unmodeled_reason = \
+                "same-name different-type redefinition (SQ16)"
+            return
+        if existing is None:
+            acl = AclDef(name, type_, item.where, item.seq)
+            self.acls[name] = acl
+        else:
+            acl = existing
+        config_dir = os.path.dirname(os.path.abspath(item.file))
+        self._parse_acl_values(acl, type_, value_toks, item,
+                               config_dir)
+
+    def _parse_acl_values(self, acl, type_, value_toks, item,
+                          config_dir):
+        if type_ not in EVALUABLE_TYPES and \
+                type_ not in UNMODELED_TYPES and \
+                not is_ssl_type(type_):
+            self.findings.append(Finding(
+                "SQ21", "finding",
+                "ACL %r has unknown type %r (not in the cfgman ACL "
+                "type list) -- the ACL is unmodeled (SQ12/SQ21)"
+                % (acl.name, type_), item.where))
+            acl.unmodeled_reason = "unknown ACL type %r (SQ21)" % type_
+            return
+        if type_ in UNMODELED_TYPES or is_ssl_type(type_):
+            for tok in value_toks:
+                acl.values.append(AclValue(tok.text, item.where))
+            if not value_toks:
+                self.findings.append(Finding(
+                    "SQ21", "finding",
+                    "acl %r (%s) has no values after the type"
+                    % (acl.name, type_), item.where))
+                acl.unmodeled_reason = "no values (SQ21)"
+            return
+        if type_ == "time":
+            specs = parse_time_specs(value_toks, item.where,
+                                     self.findings)
+            if specs is None:
+                acl.unmodeled_reason = "unparseable time spec (SQ21)"
+                return
+            acl.time_specs = specs
+            acl.values.append(AclValue("time", item.where))
+            return
+        if not value_toks:
+            self.findings.append(Finding(
+                "SQ21", "finding",
+                "acl %r (%s) has no values after the type"
+                % (acl.name, type_), item.where))
+            acl.unmodeled_reason = "no values (SQ21)"
+            return
+        if type_ == "dstdomain":
+            rest = []
+            for tok in value_toks:
+                if tok.text == "-n":
+                    acl.no_lookup = True
+                else:
+                    rest.append(tok)
+            value_toks = rest
+        insensitive = False
+        for tok in value_toks:
+            if type_ in ("dstdom_regex", "url_regex", "urlpath_regex"):
+                if tok.text == "-i":
+                    insensitive = True
+                    continue
+                if tok.text == "+i":
+                    insensitive = False
+                    continue
+            if tok.quoted:
+                expanded = expand_value_file(
+                    tok.text, config_dir, item.where, self.findings)
+                if expanded is None:
+                    self.findings.append(Finding(
+                        "SQ20", "finding",
+                        "ACL value file %r for acl %r is missing or "
+                        "unreadable -- the ACL is unmodeled, never "
+                        "an empty value list (SQ20)"
+                        % (tok.text, acl.name), item.where))
+                    acl.unmodeled_reason = \
+                        "missing value file %r (SQ20)" % tok.text
+                    return
+                for text, prov in expanded:
+                    self._add_value(acl, type_, text, prov,
+                                    insensitive)
+            else:
+                self._add_value(acl, type_, tok.text, item.where,
+                                insensitive)
+
+    def _add_value(self, acl, type_, text, provenance, insensitive):
+        if type_ in ("dstdom_regex", "url_regex", "urlpath_regex"):
+            compiled = translate_regex(text)
+            acl.values.append(AclValue(
+                text, provenance, case_insensitive=insensitive,
+                compiled=compiled,
+                untranslatable=(compiled is None)))
+            return
+        if type_ in ("src", "dst", "localip", "myip"):
+            if text != "all" and not _looks_like_ip_value(text):
+                acl.has_hostname = True
+        acl.values.append(AclValue(text, provenance))
+
+    def _parse_rule(self, item):
+        toks = item.tokens
+        if len(toks) < 2 or toks[1].text not in ("allow", "deny"):
+            self._unparseable(
+                item, "malformed http_access line: action must be "
+                "allow or deny (SQ21)")
+            return
+        terms = []
+        for tok in toks[2:]:
+            if tok.text == "!":
+                self._unparseable(
+                    item, "malformed http_access line: lone `!` "
+                    "with no ACL name (SQ21)")
+                return
+            if tok.text.startswith("!"):
+                terms.append((True, tok.text[1:]))
+            else:
+                terms.append((False, tok.text))
+        self.rules.append(Rule(toks[1].text, terms, item.where,
+                               item.seq))
+
+
+def _looks_like_ip_value(text):
+    """True when a src/dst/localip value is an IP, CIDR, netmask, or
+    range (a literal); anything else is a hostname value (SQ10)."""
+    if text == "all":
+        return True
+    if "-" in text and "/" not in text:
+        parts = text.split("-", 1)
+        try:
+            ipaddress.ip_address(parts[0])
+            ipaddress.ip_address(parts[1])
+            return True
+        except ValueError:
+            return False
+    try:
+        ipaddress.ip_network(text, strict=False)
+        return True
+    except ValueError:
+        pass
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+# ------------------------------------------------------------- the query
+
+SCHEME_DEFAULT_PORTS = {"http": 80, "https": 443, "ftp": 21}
+
+
+def parse_at(text):
+    """Parse --at: an ISO datetime, or a bare HH:MM meaning today.
+    A naive value is read as local time; an explicit offset is
+    honored (converted to local). Raises UsageError on bad input."""
+    bare = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", text)
+    if bare:
+        now = datetime.datetime.now()
+        try:
+            return now.replace(hour=int(bare.group(1)),
+                               minute=int(bare.group(2)),
+                               second=int(bare.group(3) or 0),
+                               microsecond=0)
+        except ValueError:
+            raise UsageError("--at %r is not a valid time" % text)
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        raise UsageError(
+            "--at %r is not an ISO datetime (or bare HH:MM)" % text)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+class Query:
+    """The request being adjudicated, with the composed URL (SQ07)."""
+
+    def __init__(self, src, dst, port, method, url, proto, at,
+                 dst_ip, local, at_given):
+        self.src = src
+        self.dst = dst
+        self.dst_ip = dst_ip
+        self.method = method
+        self.at = at
+        self.at_given = at_given
+        self.local = local        # (ipaddress, int) or None
+        self.url_given = url
+        # -- dst / port / proto resolution, with override findings.
+        self.findings = []
+        self.dst_host = dst
+        self.port = port
+        self.port_source = "explicit" if port is not None else None
+        self.proto = (proto or "").upper() if proto else None
+        self.url_host = None
+        self.url_port = None
+        self.url_scheme = None
+        self.url_path = "/"
+        self.url_query = ""
+        self.url_userinfo = ""
+        if url is not None:
+            self._parse_url(url)
+        if self.proto is None:
+            self.proto = (self.url_scheme or "http").upper()
+        if self.port is None:
+            if self.url_port is not None:
+                self.port = self.url_port
+                self.port_source = "url"
+            elif self.proto.lower() in SCHEME_DEFAULT_PORTS:
+                self.port = SCHEME_DEFAULT_PORTS[self.proto.lower()]
+                self.port_source = "default"
+            else:
+                self.port = None
+                self.port_source = "none"
+        if self.port is not None:
+            self.port = int(self.port)
+        self.composed_url = self._compose_url()
+        # urlpath_regex target: path + ?query, empty for CONNECT.
+        if method == "CONNECT":
+            self.pathquery = ""
+        else:
+            self.pathquery = self.url_path
+            if self.url_query:
+                self.pathquery += "?" + self.url_query
+
+    def _parse_url(self, url):
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        if not parts.scheme:
+            raise UsageError("--url %r has no scheme" % url)
+        self.url_scheme = parts.scheme
+        if not parts.hostname:
+            raise UsageError("--url %r has no host" % url)
+        self.url_host = parts.hostname
+        try:
+            self.url_port = parts.port
+        except ValueError:
+            raise UsageError("--url %r has an invalid port" % url)
+        self.url_path = parts.path or "/"
+        self.url_query = parts.query or ""
+        if parts.username:
+            self.url_userinfo = parts.username
+            if parts.password:
+                self.url_userinfo += ":" + parts.password
+        if self.dst_host != self.url_host:
+            self.findings.append(Finding(
+                "SQ07", "info",
+                "explicit --dst %r overrides --url host %r"
+                % (self.dst_host, self.url_host)))
+        if self.port is not None and self.url_port is not None and \
+                self.port != self.url_port:
+            self.findings.append(Finding(
+                "SQ07", "info",
+                "explicit --port %d overrides --url port %d"
+                % (self.port, self.url_port)))
+        if self.proto is not None and \
+                self.proto.lower() != self.url_scheme.lower():
+            self.findings.append(Finding(
+                "SQ07", "info",
+                "explicit --proto %r overrides --url scheme %r"
+                % (self.proto, self.url_scheme)))
+
+    def _compose_url(self):
+        host = self.dst_host
+        if self.method == "CONNECT":
+            # Authority form: host:port, no path, no scheme (SQ07).
+            if self.port is not None:
+                return "%s:%d" % (host, self.port)
+            return host
+        scheme = self.proto.lower()
+        netloc = host
+        if self.url_userinfo:
+            netloc = self.url_userinfo + "@" + netloc
+        default = SCHEME_DEFAULT_PORTS.get(scheme)
+        if self.port is not None and self.port != default:
+            netloc += ":%d" % self.port
+        url = "%s://%s%s" % (scheme, netloc, self.url_path)
+        if self.url_query:
+            url += "?" + self.url_query
+        return url
+
+    def dst_host_normalized(self):
+        """Destination host for dstdomain/dstdom_regex: one trailing
+        dot stripped (SQ08, [hypothesized] normalization)."""
+        host = self.dst_host
+        if host.endswith("."):
+            host = host[:-1]
+        return host
+
+
+# ------------------------------------------------------- ACL evaluation
+
+def ip_matches_value(value_text, ip_obj):
+    """One literal src/dst/localip value against an ipaddress."""
+    if value_text == "all":
+        return True
+    if "-" in value_text and "/" not in value_text:
+        lo, hi = value_text.split("-", 1)
+        try:
+            return int(ipaddress.ip_address(lo)) <= int(ip_obj) <= \
+                int(ipaddress.ip_address(hi))
+        except ValueError:
+            return False
+    try:
+        return ip_obj in ipaddress.ip_network(value_text,
+                                              strict=False)
+    except ValueError:
+        pass
+    try:
+        return ip_obj == ipaddress.ip_address(value_text)
+    except ValueError:
+        return False
+
+
+class TermResult:
+    __slots__ = ("value", "note", "unmodeled", "used_regex",
+                 "used_time")
+
+    def __init__(self, value, note, unmodeled=None,
+                 used_regex=False, used_time=False):
+        self.value = value
+        self.note = note
+        self.unmodeled = unmodeled      # (reason, where) or None
+        self.used_regex = used_regex
+        self.used_time = used_time
+
+
+def _unknown(reason, where):
+    return TermResult(UNKNOWN, reason,
+                      unmodeled=(reason, where))
+
+
+def eval_acl(acl, query):
+    """Evaluate one ACL against the query. Returns a TermResult."""
+    if acl.conflict or acl.unmodeled_reason is not None:
+        reason = acl.unmodeled_reason or \
+            "same-name different-type redefinition (SQ16)"
+        return _unknown("acl %r is unmodeled: %s" % (acl.name, reason),
+                        acl.where)
+    fn = _EVALUATORS.get(acl.type)
+    if fn is None:
+        return _unknown("acl %r has unmodeled type %r (SQ12)"
+                        % (acl.name, acl.type), acl.where)
+    return fn(acl, query)
+
+
+def _eval_ip_list(acl, query, ip_obj, missing_reason):
+    """Shared src/dst/localip evaluation. `ip_obj` is None when the
+    input the ACL needs was not supplied. Hostname values make the
+    term UNKNOWN when no literal value matches (SQ10) -- Kleene OR
+    absorption applies when a literal value already matches."""
+    if ip_obj is None:
+        return _unknown(missing_reason, acl.where)
+    for val in acl.values:
+        if ip_matches_value(val.text, ip_obj):
+            return TermResult(TRUE, "%s %s matched %s"
+                              % (acl.type, val.text, ip_obj))
+    if acl.has_hostname:
+        return _unknown(
+            "%s acl %r contains a hostname value, which needs DNS "
+            "at runtime -- unknowable statically (SQ10)"
+            % (acl.type, acl.name), acl.where)
+    return TermResult(FALSE, "no %s value matched %s"
+                     % (acl.type, ip_obj))
+
+
+def _eval_src(acl, query):
+    if query.src is None:
+        return _unknown("src acl %r needs --src, which was not "
+                        "supplied (SQ10)" % acl.name, acl.where)
+    return _eval_ip_list(acl, query, query.src, "")
+
+
+def _eval_dst(acl, query):
+    dst_ip = query.dst_ip
+    if dst_ip is None:
+        try:
+            dst_ip = ipaddress.ip_address(query.dst_host)
+        except ValueError:
+            dst_ip = None
+    if dst_ip is None:
+        return _unknown("dst acl %r needs --dst-ip when --dst is a "
+                        "hostname (Squid DNS-resolves the URL host, "
+                        "SQ03) -- unknowable statically"
+                        % acl.name, acl.where)
+    return _eval_ip_list(acl, query, dst_ip, "")
+
+
+def _eval_dstdomain(acl, query):
+    host = query.dst_host_normalized()
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if is_ip:
+        if acl.no_lookup:
+            return TermResult(
+                FALSE, "dstdomain %r: -n suppresses the reverse "
+                "lookup, so an IP URL never matches (SQ08)"
+                % acl.name)
+        return _unknown("dstdomain %r against IP URL %s needs a "
+                        "reverse lookup (SQ08) -- unknowable "
+                        "statically" % (acl.name, host), acl.where)
+    host_l = host.lower()
+    for val in acl.values:
+        pat = val.text.lower()
+        if pat == "none":
+            continue
+        if pat.startswith("."):
+            if host_l == pat[1:] or host_l.endswith(pat):
+                return TermResult(
+                    TRUE, "dstdomain %s matched %s (whole-domain)"
+                    % (val.text, host))
+        elif host_l == pat:
+            return TermResult(
+                TRUE, "dstdomain %s matched %s (exact host)"
+                % (val.text, host))
+    return TermResult(FALSE, "no dstdomain value matched %s" % host)
+
+
+def _eval_regex(acl, query, target, label):
+    for val in acl.values:
+        if val.untranslatable:
+            continue
+        flags = re.IGNORECASE if val.case_insensitive else 0
+        try:
+            pattern = val.compiled
+            if val.case_insensitive and \
+                    not (pattern.flags & re.IGNORECASE):
+                pattern = re.compile(pattern.pattern, flags)
+            elif not val.case_insensitive and \
+                    (pattern.flags & re.IGNORECASE):
+                pattern = re.compile(pattern.pattern, 0)
+        except re.error:
+            continue
+        if pattern.search(target):
+            return TermResult(
+                TRUE, "%s /%s/ matched %r" % (label, val.text, target),
+                used_regex=True)
+    if any(v.untranslatable for v in acl.values):
+        return TermResult(
+            UNKNOWN, "%s %r has a pattern Python `re` cannot "
+            "express -- untranslatable regex is UNKNOWN, never a "
+            "guess (SQ15)" % (label, acl.name),
+            unmodeled=("untranslatable regex in %s %r (SQ15)"
+                       % (label, acl.name), acl.where),
+            used_regex=True)
+    return TermResult(FALSE, "no %s pattern matched %r"
+                     % (label, target))
+
+
+def _eval_dstdom_regex(acl, query):
+    return _eval_regex(acl, query, query.dst_host_normalized(),
+                       "dstdom_regex")
+
+
+def _eval_url_regex(acl, query):
+    return _eval_regex(acl, query, query.composed_url, "url_regex")
+
+
+def _eval_urlpath_regex(acl, query):
+    return _eval_regex(acl, query, query.pathquery, "urlpath_regex")
+
+
+def _eval_port(acl, query):
+    for val in acl.values:
+        if val.text == "0":
+            if query.port_source == "none":
+                return TermResult(
+                    TRUE, "port 0 matched: no explicit, URL, or "
+                    "default port (SQ10)")
+            continue
+        if query.port is None:
+            continue
+        if "-" in val.text:
+            try:
+                lo, hi = (int(x) for x in val.text.split("-", 1))
+            except ValueError:
+                continue
+            if lo <= query.port <= hi:
+                return TermResult(
+                    TRUE, "port %s matched %d" % (val.text, query.port))
+        else:
+            try:
+                if int(val.text) == query.port:
+                    return TermResult(
+                        TRUE, "port %s matched %d"
+                        % (val.text, query.port))
+            except ValueError:
+                continue
+    if query.port is None:
+        if any(v.text == "0" for v in acl.values):
+            return TermResult(FALSE, "port 0 did not match: a port "
+                              "was supplied or a scheme default "
+                              "applies (SQ10)")
+        return _unknown("port acl %r: the destination port is not "
+                        "knowable from this query (no --port, no "
+                        "--url port, no scheme default) (SQ10)"
+                        % acl.name, acl.where)
+    return TermResult(FALSE, "no port value matched %d" % query.port)
+
+
+def _eval_myport(acl, query):
+    if query.local is None:
+        return _unknown("%s acl %r needs --local ADDR:PORT, which "
+                        "was not supplied (SQ03)" % (acl.type,
+                                                      acl.name),
+                        acl.where)
+    local_port = query.local[1]
+    for val in acl.values:
+        if "-" in val.text:
+            try:
+                lo, hi = (int(x) for x in val.text.split("-", 1))
+            except ValueError:
+                continue
+            if lo <= local_port <= hi:
+                return TermResult(
+                    TRUE, "%s %s matched local port %d"
+                    % (acl.type, val.text, local_port))
+        else:
+            try:
+                if int(val.text) == local_port:
+                    return TermResult(
+                        TRUE, "%s %s matched local port %d"
+                        % (acl.type, val.text, local_port))
+            except ValueError:
+                continue
+    return TermResult(FALSE, "no %s value matched local port %d"
+                     % (acl.type, local_port))
+
+
+def _eval_localip(acl, query):
+    if query.local is None:
+        return _unknown("%s acl %r needs --local ADDR:PORT, which "
+                        "was not supplied (SQ03)" % (acl.type,
+                                                      acl.name),
+                        acl.where)
+    return _eval_ip_list(acl, query, query.local[0], "")
+
+
+def _eval_method(acl, query):
+    for val in acl.values:
+        if val.text == query.method:
+            return TermResult(TRUE, "method %s matched %s"
+                              % (val.text, query.method))
+    return TermResult(FALSE, "no method value matched %s"
+                     % query.method)
+
+
+def _eval_proto(acl, query):
+    for val in acl.values:
+        if val.text == "cache_object":
+            continue            # never matches a real request (SQ03)
+        if val.text.upper() == query.proto:
+            return TermResult(TRUE, "proto %s matched %s"
+                              % (val.text, query.proto))
+    return TermResult(FALSE, "no proto value matched %s" % query.proto)
+
+
+def _eval_time(acl, query):
+    instant = query.at
+    if instant is None:
+        instant = datetime.datetime.now()
+    weekday = instant.weekday()
+    minutes = instant.hour * 60 + instant.minute
+    for days, span in (acl.time_specs or []):
+        if days is not None and weekday not in days:
+            continue
+        if span is not None and not (span[0] <= minutes < span[1]):
+            continue
+        return TermResult(
+            TRUE, "time matched %s (%s)"
+            % (instant.strftime("%a %H:%M"),
+               "days %s" % sorted(days) if days is not None else
+               "any day"),
+            used_time=True)
+    return TermResult(
+        FALSE, "time did not match %s"
+        % instant.strftime("%a %H:%M"), used_time=True)
+
+
+_EVALUATORS = {
+    "src": _eval_src,
+    "dst": _eval_dst,
+    "dstdomain": _eval_dstdomain,
+    "dstdom_regex": _eval_dstdom_regex,
+    "url_regex": _eval_url_regex,
+    "urlpath_regex": _eval_urlpath_regex,
+    "port": _eval_port,
+    "myport": _eval_myport,
+    "localport": _eval_myport,
+    "localip": _eval_localip,
+    "myip": _eval_localip,
+    "method": _eval_method,
+    "proto": _eval_proto,
+    "time": _eval_time,
+}
+
+
+def eval_term(cfg, rule, negated, acl_name, query, findings,
+              unmodeled):
+    """Evaluate one rule term (an ACL reference, optionally
+    negated). Returns a TermResult for the term as used in the
+    rule (negation applied). Dangling / forward / conflict
+    references are UNKNOWN (SQ17/SQ16), absorbed by Kleene AND
+    when another term already decides the rule."""
+    acl = cfg.acls.get(acl_name)
+    if acl is None:
+        findings.append(Finding(
+            "SQ17", "finding",
+            "rule at %s references ACL %r, which is never defined"
+            % (rule.where, acl_name), rule.where))
+        res = TermResult(UNKNOWN, "ACL %r is never defined (SQ17)"
+                         % acl_name)
+    elif acl.seq > rule.seq:
+        findings.append(Finding(
+            "SQ17", "finding",
+            "rule at %s references ACL %r, defined only later at "
+            "%s -- Squid makes a single pass and refuses this "
+            "config (SQ02/SQ17)" % (rule.where, acl_name, acl.where),
+            rule.where))
+        res = TermResult(UNKNOWN, "ACL %r is defined after this "
+                         "rule (SQ02/SQ17)" % acl_name)
+    else:
+        res = eval_acl(acl, query)
+    if res.unmodeled is not None:
+        unmodeled.append(res.unmodeled)
+    if res.value == UNKNOWN:
+        return TermResult(UNKNOWN, res.note,
+                          used_regex=res.used_regex,
+                          used_time=res.used_time)
+    if negated:
+        val = tri_not(res.value)
+        note = "NOT (%s)" % res.note
+    else:
+        val = res.value
+        note = res.note
+    return TermResult(val, note, used_regex=res.used_regex,
+                      used_time=res.used_time)
+
+
+def eval_rule(cfg, rule, query, findings, unmodeled):
+    """Evaluate one http_access rule (Kleene AND across terms).
+    Returns (value, deciding_note, used_regex, used_time)."""
+    if not rule.terms:
+        return TRUE, "unconditional rule (no ACL elements, SQ01)", \
+            False, False
+    results = []
+    for negated, name in rule.terms:
+        res = eval_term(cfg, rule, negated, name, query, findings,
+                        unmodeled)
+        results.append(res)
+    value = tri_and([r.value for r in results])
+    if value == FALSE:
+        deciding = next(r for r in results if r.value == FALSE)
+        note = deciding.note
+    elif value == UNKNOWN:
+        deciding = next(r for r in results if r.value == UNKNOWN)
+        note = deciding.note
+    else:
+        note = "; ".join(r.note for r in results)
+    used_regex = any(r.used_regex for r in results)
+    used_time = any(r.used_time for r in results)
+    return value, note, used_regex, used_time
+
+
+# ------------------------------------------------------------ the walk
+
+def dstdomain_overlap_findings(cfg):
+    """SQ08: flag any ACL where one dstdomain value is a subdomain
+    of another value in the same ACL (the splay-tree overlap
+    quirk -- the union is evaluated, the operator is warned)."""
+    out = []
+    for acl in cfg.acls.values():
+        if acl.type != "dstdomain":
+            continue
+        vals = [v.text.lower() for v in acl.values]
+        for i, a in enumerate(vals):
+            for b in vals[i + 1:]:
+                if _domain_contains(a, b) or _domain_contains(b, a):
+                    out.append(Finding(
+                        "SQ08", "finding",
+                        "dstdomain ACL %r contains overlapping "
+                        "values %r and %r -- the live daemon may "
+                        "honor only the most specific (splay-tree "
+                        "quirk); the union is evaluated here"
+                        % (acl.name, a, b), acl.where))
+                    break
+    return out
+
+
+def _domain_contains(outer, inner):
+    """True when domain value `outer` covers `inner` as a subdomain
+    (both normalized: leading-dot values are whole-domain)."""
+    if outer.startswith("."):
+        outer_host = outer[1:]
+        if inner.startswith("."):
+            return inner[1:] == outer_host or \
+                inner[1:].endswith("." + outer_host)
+        return inner == outer_host or inner.endswith("." + outer_host)
+    return False
+
+
+def walk(cfg, query):
+    """The SQ13 walk over the merged order of rules and poisonable
+    unparseable lines. Returns (verdict, decider, blocker, trace,
+    findings, unmodeled, used_regex, used_time)."""
+    findings = list(cfg.findings) + list(query.findings)
+    findings += dstdomain_overlap_findings(cfg)
+    unmodeled = []
+    trace = []
+    merged = sorted(cfg.rules + cfg.poison, key=lambda it: it.seq)
+    used_regex = False
+    used_time = False
+    for item in merged:
+        if isinstance(item, Item):
+            # An unparseable line reached before any TRUE rule: it
+            # could be a rule v1 does not know, so it poisons (SQ21).
+            blocker = "unparseable line at %s (SQ21): %s" % (
+                item.where,
+                " ".join(t.text for t in item.tokens))
+            trace.append({"rule": None, "where": item.where,
+                          "value": "UNKNOWN",
+                          "note": "unparseable line -- could be a "
+                          "rule v1 does not know (SQ21)"})
+            return ("UNKNOWN",
+                    {"kind": "unparseable", "where": item.where,
+                     "action": None,
+                     "note": "unparseable line (SQ21)"},
+                    blocker, trace, findings, unmodeled,
+                    used_regex, used_time)
+        value, note, ur, ut = eval_rule(cfg, item, query, findings,
+                                        unmodeled)
+        if ur:
+            used_regex = True
+        if ut:
+            used_time = True
+        if value == TRUE:
+            trace.append({"rule": "http_access %s %s" % (
+                item.action,
+                " ".join(("!" if n else "") + nm
+                         for n, nm in item.terms)),
+                "where": item.where, "value": "TRUE", "note": note})
+            for later in cfg.rules:
+                if later.seq > item.seq:
+                    trace.append({"rule": "http_access %s %s" % (
+                        later.action,
+                        " ".join(("!" if n else "") + nm
+                                 for n, nm in later.terms)),
+                        "where": later.where, "value": "SHADOWED",
+                        "note": "unevaluated -- a prior rule won "
+                        "(SQ13)"})
+            verdict = "ALLOW" if item.action == "allow" else "DENY"
+            decider = {"kind": "http_access", "where": item.where,
+                       "action": item.action,
+                       "note": "first matching rule (SQ01/SQ13)"}
+            return (verdict, decider, None, trace, findings,
+                    unmodeled, used_regex, used_time)
+        if value == UNKNOWN:
+            blocker = "rule at %s (%s) is UNKNOWN: %s" % (
+                item.where, item.action, note)
+            trace.append({"rule": "http_access %s %s" % (
+                item.action,
+                " ".join(("!" if n else "") + nm
+                         for n, nm in item.terms)),
+                "where": item.where, "value": "UNKNOWN", "note": note})
+            return ("UNKNOWN",
+                    {"kind": "blocker", "where": item.where,
+                     "action": item.action,
+                     "note": "UNKNOWN rule blocks the walk (SQ10)"},
+                    blocker, trace, findings, unmodeled,
+                    used_regex, used_time)
+        trace.append({"rule": "http_access %s %s" % (
+            item.action,
+            " ".join(("!" if n else "") + nm
+                     for n, nm in item.terms)),
+            "where": item.where, "value": "FALSE", "note": note})
+    # No TRUE rule and no blocker: the SQ06 default.
+    if not cfg.rules:
+        decider = {"kind": "implicit-default", "where": None,
+                   "action": "deny",
+                   "note": "no http_access rules (SQ06)"}
+        return ("DENY", decider, None, trace, findings, unmodeled,
+                used_regex, used_time)
+    last = cfg.rules[-1]
+    action = "deny" if last.action == "allow" else "allow"
+    verdict = "ALLOW" if action == "allow" else "DENY"
+    decider = {"kind": "implicit-default", "where": last.where,
+               "action": action, "last_action": last.action,
+               "note": "reverse of last rule (%s at %s, SQ06)"
+               % (last.action, last.where)}
+    return (verdict, decider, None, trace, findings, unmodeled,
+            used_regex, used_time)
+
+# -------------------------------------------------------- report & render
+
+BANNERS = [
+    "verdicts cover http_access only; cache_peer_access, "
+    "always_direct/never_direct, miss_access, http_reply_access, "
+    "adapted_http_access, delay_access, ssl_bump and cache/no_cache "
+    "rules are listed, never verdicted (SQ23).",
+    "on-disk policy only: a running daemon's in-memory state "
+    "(helper replies, maxconn counters, DNS cache) can diverge "
+    "from these files.",
+    "squidwho is not a validator: `squid -k parse` remains the "
+    "validation path; broken directives outside the queried walk "
+    "are findings, not verdicts.",
+]
+
+
+def _dedupe_findings(findings):
+    seen = set()
+    out = []
+    for f in findings:
+        key = (f.fid, f.severity, f.message, f.where)
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
+
+
+def coverage_dict(cfg, trace):
+    evaluated_false = sum(1 for t in trace if t["value"] == "FALSE")
+    shadowed = sum(1 for t in trace if t["value"] == "SHADOWED")
+    blocked = sum(1 for t in trace if t["value"] == "UNKNOWN")
+    return {
+        "files": cfg.loader.files,
+        "acls": [{"name": a.name, "type": a.type,
+                  "values": len(a.values),
+                  "evaluable": a.evaluable(),
+                  "where": a.where,
+                  "builtin": a.builtin}
+                 for a in cfg.acls.values()],
+        "rules": {"total": len(cfg.rules),
+                  "evaluated_false": evaluated_false,
+                  "shadowed": shadowed, "blocked": blocked},
+        "unparseable_lines": cfg.unparseable,
+        "unparseable_count": len(cfg.unparseable),
+        "other_directives": dict(cfg.other_counts),
+    }
+
+
+def build_report(cfg, query, verdict, decider, blocker, trace,
+                 findings, unmodeled, used_regex, used_time):
+    findings = _dedupe_findings(findings)
+    banners = list(BANNERS)
+    if used_regex:
+        banners.append("[regex-approx] the decider trace rests on a "
+                       "regex term: Squid regexes are POSIX-ERE and "
+                       "this tool translates them to Python `re` "
+                       "where the syntax coincides (SQ15).")
+    if used_time and not query.at_given:
+        banners.append("[time-is-now-local] a time term was "
+                       "evaluated against this machine's current "
+                       "local time, which may not be the proxy "
+                       "host's clock -- use --at for a reproducible "
+                       "verdict (SQ11).")
+    if query.url_given and query.findings:
+        pass
+    report = {
+        "tool": "squidwho",
+        "version": VERSION,
+        "verdict": verdict,
+        "decider": decider,
+        "blocker": blocker,
+        "composed_url": query.composed_url,
+        "trace": trace,
+        "findings": [f.as_json() for f in findings],
+        "unmodeled": [{"reason": r, "where": w}
+                      for r, w in _dedupe_unmodeled(unmodeled)],
+        "coverage": coverage_dict(cfg, trace),
+        "banners": banners,
+    }
+    return report
+
+
+def _dedupe_unmodeled(unmodeled):
+    seen = set()
+    out = []
+    for r, w in unmodeled:
+        if (r, w) not in seen:
+            seen.add((r, w))
+            out.append((r, w))
+    return out
+
+
+def render_text(report):
+    lines = [report["verdict"]]
+    decider = report.get("decider") or {}
+    kind = decider.get("kind")
+    if kind == "http_access":
+        lines.append("decider: http_access %s at %s"
+                     % (decider["action"], decider["where"]))
+    elif kind == "implicit-default":
+        if decider.get("where"):
+            lines.append("decider: implicit-default (%s) -- last "
+                         "rule %s at %s"
+                         % (decider["note"],
+                            decider.get("last_action",
+                                        decider["action"]),
+                            decider["where"]))
+        else:
+            lines.append("decider: implicit-default (%s)"
+                         % decider["note"])
+    elif kind == "blocker":
+        lines.append("decider: %s" % decider["note"])
+    elif kind == "unparseable":
+        lines.append("decider: %s" % decider["note"])
+    if report.get("blocker"):
+        lines.append("blocker: %s" % report["blocker"])
+    if report.get("composed_url"):
+        lines.append("url: %s" % report["composed_url"])
+    if report["trace"]:
+        lines.append("trace:")
+        for t in report["trace"]:
+            rule = t["rule"] or "unparseable line"
+            where = " (%s)" % t["where"] if t.get("where") else ""
+            lines.append("  %s: %s%s -- %s" % (
+                t["value"], rule, where, t["note"]))
+    if report["findings"]:
+        lines.append("")
+        lines.append("findings:")
+        for f in report["findings"]:
+            loc = " (%s)" % f["where"] if f.get("where") else ""
+            lines.append("  [%s] %s: %s%s" % (
+                f["id"], f["severity"], f["message"], loc))
+    if report["unmodeled"]:
+        lines.append("")
+        lines.append("unmodeled (SQ12 -- bannered, never approximated):")
+        for u in report["unmodeled"]:
+            loc = " (%s)" % u["where"] if u.get("where") else ""
+            lines.append("  - %s%s" % (u["reason"], loc))
+    cov = report["coverage"]
+    lines.append("")
+    lines.append("coverage: %d file(s), %d ACL(s), %d rule(s); "
+                 "evaluated-false: %d, shadowed: %d, blocked: %d; "
+                 "unparseable lines: %d; other access directives: %s"
+                 % (len(cov["files"]), len(cov["acls"]),
+                    cov["rules"]["total"],
+                    cov["rules"]["evaluated_false"],
+                    cov["rules"]["shadowed"],
+                    cov["rules"]["blocked"],
+                    cov["unparseable_count"],
+                    ", ".join("%s=%d" % kv for kv in sorted(
+                        cov["other_directives"].items())) or "none"))
+    for f in cov["files"]:
+        inc = " (included from %s)" % f["included_from"] \
+            if f.get("included_from") else ""
+        lines.append("  file: %s (%d bytes, %d lines)%s"
+                     % (f["path"], f["bytes"], f["lines"], inc))
+    for b in report["banners"]:
+        lines.append("banner: %s" % b)
+    return "\n".join(lines) + "\n"
+
+
+def sq06_default_text(cfg):
+    """The SQ06 default the loaded rule list implies, stated
+    explicitly (SQ22)."""
+    if not cfg.rules:
+        return ("implicit default: DENY -- no http_access rules "
+                "(SQ06)")
+    last = cfg.rules[-1]
+    action = "deny" if last.action == "allow" else "allow"
+    return ("implicit default: %s -- reverse of last rule (%s at %s, "
+            "SQ06)" % (action.upper(), last.action, last.where))
+
+
+def render_inventory(cfg, list_acls, list_rules, as_json):
+    findings = _dedupe_findings(cfg.findings +
+                                dstdomain_overlap_findings(cfg))
+    data = {
+        "tool": "squidwho",
+        "version": VERSION,
+        "mode": "inventory",
+        "acls": [],
+        "rules": [],
+        "implicit_default": sq06_default_text(cfg),
+        "findings": [f.as_json() for f in findings],
+        "coverage": coverage_dict(cfg, []),
+        "banners": list(BANNERS),
+    }
+    if list_acls:
+        for a in cfg.acls.values():
+            data["acls"].append({
+                "name": a.name, "type": a.type,
+                "values": len(a.values),
+                "evaluable": a.evaluable(),
+                "where": a.where,
+                "builtin": a.builtin,
+                "unmodeled_reason": a.unmodeled_reason,
+            })
+    if list_rules:
+        for r in cfg.rules:
+            data["rules"].append({
+                "action": r.action,
+                "terms": [("!" if n else "") + nm
+                          for n, nm in r.terms],
+                "where": r.where,
+            })
+    count = len(data["acls"]) + len(data["rules"])
+    if as_json:
+        return json.dumps(data, indent=2) + "\n", count
+    lines = []
+    if list_acls:
+        lines.append("ACLs:")
+        for a in data["acls"]:
+            status = "evaluable" if a["evaluable"] else \
+                "unmodeled (%s)" % (a["unmodeled_reason"] or "SQ12")
+            lines.append("  %s (%s, %d value(s), %s)%s" % (
+                a["name"], a["type"], a["values"], status,
+                (" at %s" % a["where"]) if a["where"] else
+                " (builtin default)"))
+    if list_rules:
+        lines.append("http_access rules:")
+        for r in data["rules"]:
+            lines.append("  %s %s (%s)" % (
+                r["action"], " ".join(r["terms"]), r["where"]))
+        lines.append(data["implicit_default"])
+    if findings:
+        lines.append("")
+        lines.append("findings:")
+        for f in data["findings"]:
+            loc = " (%s)" % f["where"] if f.get("where") else ""
+            lines.append("  [%s] %s: %s%s" % (
+                f["id"], f["severity"], f["message"], loc))
+    return "\n".join(lines) + "\n", count
+
+
+# ------------------------------------------------------------------- main
+
+def _ip_arg(text):
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "%r is not a valid IP address" % text)
+
+
+def _port_arg(text):
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "%r is not a port number" % text)
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError(
+            "port %d out of range 0-65535" % n)
+    return n
+
+
+def _local_arg(text):
+    if ":" not in text:
+        raise argparse.ArgumentTypeError(
+            "--local takes ADDR:PORT, got %r" % text)
+    addr, _, port = text.rpartition(":")
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "%r is not a valid local IP address" % addr)
+    return (ip, _port_arg(port))
+
+
+def load_config(conf_paths):
+    loader = Loader()
+    try:
+        loader.load(conf_paths)
+    except FatalConfig as exc:
+        raise
+    return Config(loader)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="squidwho",
+        description="Which http_access line allows or denies a "
+        "request, and which acl lines decided it (static model of "
+        "Squid's documented access rules).")
+    ap.add_argument("--src", type=_ip_arg,
+                    help="source IP of the request")
+    ap.add_argument("--dst", help="destination host of the request")
+    ap.add_argument("--port", type=_port_arg,
+                    help="destination port")
+    ap.add_argument("--method", default="GET",
+                    help="HTTP method (default GET)")
+    ap.add_argument("--url", help="full request URL (supplies "
+                    "dst/port/path/proto; explicit flags override)")
+    ap.add_argument("--proto", help="protocol (default: from --url "
+                    "scheme, else HTTP)")
+    ap.add_argument("--at", help="instant to evaluate time ACLs "
+                    "against: ISO datetime, or bare HH:MM (today)")
+    ap.add_argument("--dst-ip", type=_ip_arg,
+                    help="destination IP (else --dst if it is a "
+                    "literal IP; else dst terms are UNKNOWN)")
+    ap.add_argument("--local", type=_local_arg,
+                    help="local socket ADDR:PORT (myport/localip)")
+    ap.add_argument("--conf", action="append", default=[],
+                    help="config file (repeatable; default "
+                    "/etc/squid/squid.conf)")
+    ap.add_argument("--list-acls", action="store_true",
+                    help="list every ACL in load order")
+    ap.add_argument("--list-rules", action="store_true",
+                    help="list every http_access rule in order, "
+                    "plus the SQ06 default")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print the verdict line only")
+    ap.add_argument("--version", action="store_true",
+                    help="print the version and exit")
+    args = ap.parse_args(argv)
+    if args.version:
+        print("squidwho %s" % VERSION)
+        return 0
+    conf_paths = list(args.conf)
+    if not conf_paths:
+        if os.path.exists(DEFAULT_CONF):
+            conf_paths = [DEFAULT_CONF]
+        else:
+            print("squidwho: no --conf given and default config %s "
+                  "does not exist" % DEFAULT_CONF, file=sys.stderr)
+            return 2
+    try:
+        cfg = load_config(conf_paths)
+    except FatalConfig as exc:
+        loc = " (%s)" % exc.where if exc.where else ""
+        print("squidwho: %s%s" % (exc.message, loc), file=sys.stderr)
+        return 2
+    if len(conf_paths) > 1:
+        cfg.findings.append(Finding(
+            "SQ19", "info",
+            "multiple --conf files concatenated in the given order "
+            "(a squidwho convenience -- Squid itself takes one "
+            "config file)"))
+    if args.list_acls or args.list_rules:
+        out, count = render_inventory(cfg, args.list_acls,
+                                      args.list_rules, args.json)
+        sys.stdout.write(out)
+        return 0 if count >= 1 else 1
+    if args.src is None or args.dst is None:
+        print("squidwho: an access query needs --src and --dst",
+              file=sys.stderr)
+        return 2
+    try:
+        at = parse_at(args.at) if args.at else None
+    except UsageError as exc:
+        print("squidwho: %s" % exc.message, file=sys.stderr)
+        return 2
+    try:
+        query = Query(args.src, args.dst, args.port, args.method,
+                      args.url, args.proto, at, args.dst_ip,
+                      args.local, args.at is not None)
+    except UsageError as exc:
+        print("squidwho: %s" % exc.message, file=sys.stderr)
+        return 2
+    verdict, decider, blocker, trace, findings, unmodeled, \
+        used_regex, used_time = walk(cfg, query)
+    report = build_report(cfg, query, verdict, decider, blocker,
+                          trace, findings, unmodeled, used_regex,
+                          used_time)
+    if args.quiet:
+        print(report["verdict"])
+    elif args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        sys.stdout.write(render_text(report))
+    return 0 if verdict == "ALLOW" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
