@@ -209,9 +209,9 @@ oracle, exactly as the manual text is the only authority.
 - [x] Tests green (83/83)
 - [x] Dogfood: doccover 15/15 + clicheck 15/15 clean (Nov 9, 2026 campaign)
 - [x] Bench-audit map extended (A1–A7 clean, Nov 9, 2026 campaign)
-- [ ] README + CHANGELOG + LICENSE (MIT) in place
-- [ ] CI workflow (.github/workflows/tests.yml, Python 3.12)
-- [ ] Prepublish-check clean
+- [x] README + CHANGELOG + LICENSE (MIT) in place
+- [x] CI workflow (.github/workflows/tests.yml, Python 3.12)
+- [x] Prepublish-check clean (Nov 9, 2026 campaign)
 
 ## License
 
